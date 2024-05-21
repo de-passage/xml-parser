@@ -3,13 +3,14 @@
 
 #include <stack>
 
+namespace xml {
+
 #define fail_if_impl_(expr, func, line)                                        \
   if ((expr)) {                                                                \
     /* std::clog << "ERROR: " << func << ':' << line << ':' << #expr <<        \
      * '\n'; // do some actual error handling here maybe */                    \
     return std::nullopt;                                                       \
   }
-
 
 #define fail_if_pp_bs_(...) fail_if_impl_(__VA_ARGS__)
 #define fail_if(...) fail_if_pp_bs_((__VA_ARGS__), __FUNCTION__, __LINE__)
@@ -20,26 +21,6 @@
   }
 
 #define advance_to(...) fail_if(!stream.seek(__VA_ARGS__))
-
-inline bool xml_tag_head(char c) { return isalpha(c) || c == '_'; }
-
-inline bool xml_tag_body(char c) {
-  return isalnum(c) || c == '_' || c == '-' || c == '.';
-}
-
-// Find string end when at opening quote
-inline size_t string_end(char_stream &stream) {
-  return find_string_end(stream, stream.cursor() + 1);
-}
-
-// Find word end when at head
-inline size_t word_end(char_stream &stream) {
-  return stream.find(std::not_fn(xml_tag_body), stream.cursor() + 1);
-}
-
-inline std::optional<std::string_view> next_xml_word(char_stream &stream) {
-  return next_word(stream, xml_tag_head, xml_tag_body);
-}
 
 std::optional<std::string_view> parse_to(char_stream &stream, auto &&func) {
   auto end = std::forward<decltype(func)>(func)(stream);
@@ -52,9 +33,9 @@ std::optional<std::string_view> next_string_or_word(char_stream &stream) {
 
   char c = stream.peek();
   if (c == '"') {
-    return parse_to(stream, string_end);
+    return parse_to(stream, xml_string_end);
   } else if (xml_tag_head(c)) {
-    return parse_to(stream, word_end);
+    return parse_to(stream, xml_word_end);
   }
   return std::nullopt;
 }
@@ -68,7 +49,7 @@ size_t tag_end(char_stream &stream, const char (&pattern)[S]) {
   while (stream) {
     auto c = stream.read_char();
 
-    break_if(c == '"' && !stream.seek(string_end(stream)));
+    break_if(c == '"' && !stream.seek(xml_string_end(stream)));
 
     if (c == *current) {
       current++;
@@ -112,7 +93,7 @@ std::optional<opening_tag> parse_attributes(char_stream &stream) {
     }
 
     if (xml_tag_head(c)) {
-      parse_to(stream, word_end)
+      parse_to(stream, xml_word_end)
           .transform([&attrs](std::string_view attr_name_end) {
             attrs.emplace_back(xml::attribute{
                 .name = std::string{attr_name_end},
@@ -187,8 +168,10 @@ loop_exit:
   return parse_tag(stream);
 }
 
-// Parse the body of a tag (content and children). The attributes must have already been processed
-std::optional<xml::tag> parse_current_tag_body(char_stream &stream, xml::tag tag) {
+// Parse the body of a tag (content and children). The attributes must have
+// already been processed
+std::optional<xml::tag> parse_current_tag_body(char_stream &stream,
+                                               xml::tag tag) {
   int buffered_space = 0;
   advance_to(std::not_fn(isspace));
   while (stream) {
@@ -229,7 +212,9 @@ std::optional<xml::tag> parse_current_tag_body(char_stream &stream, xml::tag tag
   return std::nullopt;
 }
 
-std::optional<xml::tag> parse_xml(char_stream &stream) {
+} // namespace xml
+
+std::optional<xml::tag> build_xml_doc(char_stream &stream) {
   xml::tag root{};
   std::vector<xml::tag> tags;
   xml::tag *current_tag = &root;
@@ -237,7 +222,7 @@ std::optional<xml::tag> parse_xml(char_stream &stream) {
   tag_stack.push(current_tag);
 
   while (stream) {
-    if (auto maybe_tag = next_tag(stream); maybe_tag.has_value()) {
+    if (auto maybe_tag = xml::next_tag(stream); maybe_tag.has_value()) {
       root.children.emplace_back(std::move(maybe_tag).value());
     } else {
       break;
@@ -245,5 +230,3 @@ std::optional<xml::tag> parse_xml(char_stream &stream) {
   }
   return root;
 }
-
-
