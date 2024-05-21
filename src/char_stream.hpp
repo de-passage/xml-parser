@@ -305,18 +305,6 @@ struct char_stream {
     return current_ == buf_().size();
   }
 
-  bool read_from(size_t s) noexcept {
-    assert(handle_ != nullptr);
-    while (buf_().size() <= s) {
-      if (stream_ended_()) {
-        return false;
-      }
-      handle_.resume();
-    }
-    current_ = s;
-    return true;
-  }
-
 private:
   bool stream_ended_() const noexcept {
     assert(handle_ != nullptr);

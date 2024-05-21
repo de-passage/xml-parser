@@ -1,8 +1,10 @@
 #include "vt100.hpp"
 
 #include "char_stream.hpp"
+#include "xml.hpp"
 
 #include <cassert>
+#include <complex>
 #include <coroutine>
 #include <iostream>
 #include <variant>
@@ -12,8 +14,8 @@ struct tag_open {
 };
 struct tag_close {
   std::string_view name;
-  bool self_closing{false};
 };
+struct tag_self_close {};
 struct tag_attribute {
   std::string_view key;
   std::string_view value;
@@ -33,6 +35,7 @@ struct header_close {};
 struct config {
   bool emit_tag_open{true};
   bool emit_tag_close{true};
+  bool emit_tag_self_close{true};
   bool emit_tag_attribute{true};
   bool emit_tag_content{true};
   bool emit_comments{false};
@@ -66,13 +69,13 @@ template <config c, class toAdd, class V> struct add_to_variant;
 
 template <config Config = config{}> struct configurable_xml_parser {
   constexpr static inline config configuration = Config;
-  using event_type =
-      detail::expand_t<configuration,
-                       detail::pair<&config::emit_tag_open, tag_open>,
-                       detail::pair<&config::emit_tag_close, tag_close>,
-                       detail::pair<&config::emit_tag_attribute, tag_attribute>,
-                       detail::pair<&config::emit_comments, comment>,
-                       detail::pair<&config::emit_tag_content, tag_content>>;
+  using event_type = detail::expand_t<
+      configuration, detail::pair<&config::emit_tag_open, tag_open>,
+      detail::pair<&config::emit_tag_close, tag_close>,
+      detail::pair<&config::emit_tag_self_close, tag_self_close>,
+      detail::pair<&config::emit_tag_attribute, tag_attribute>,
+      detail::pair<&config::emit_comments, comment>,
+      detail::pair<&config::emit_tag_content, tag_content>>;
 
   struct promise_type;
   using handle_type = std::coroutine_handle<promise_type>;
@@ -124,6 +127,15 @@ template <config Config = config{}> struct configurable_xml_parser {
 
     auto yield_value(tag_content t) noexcept {
       if constexpr (configuration.emit_tag_content) {
+        current_event = t;
+        return std::suspend_always{};
+      } else {
+        return std::suspend_never{};
+      }
+    }
+
+    auto yield_value(tag_self_close t) noexcept {
+      if constexpr (configuration.emit_tag_self_close) {
         current_event = t;
         return std::suspend_always{};
       } else {
@@ -210,23 +222,139 @@ private:
 
 using xml_parser = configurable_xml_parser<>;
 
+#define fail_if(cond)                                                          \
+  if (cond) {                                                                  \
+    std::cerr << "FAILED " #cond << " in " << __FUNCTION__ << ":" << __LINE__              \
+              << std::endl;                                                    \
+    co_return;                                                                 \
+  }
+
+#define advance_to(...) fail_if(!stream.seek(__VA_ARGS__))
+
+std::optional<std::string_view> parse_to(char_stream &stream, auto &&func) {
+  auto end = std::forward<decltype(func)>(func)(stream);
+  if (end == std::string::npos) {
+    return std::nullopt;
+  }
+  return stream.consume_to(end);
+}
+
 bool find_opening_char(char_stream &stream) {
   return stream.seek(stream.find('<'));
 }
 
 template <config Config>
 configurable_xml_parser<Config> parse_tag_name(char_stream &stream) {
+  auto end = xml::xml_word_end(stream);
+  fail_if(end == std::string::npos);
+  auto name = stream.consume_to(end);
+  co_yield tag_open{name};
   co_return;
+}
+template <config Config>
+configurable_xml_parser<Config> parse_tag_close(char_stream &stream) {
+  auto name = parse_to(stream, xml::xml_word_end);
+  fail_if(!name);
+  co_yield tag_close{*name};
+  co_return;
+}
+
+template <config Config>
+configurable_xml_parser<Config> parse_tag_content(char_stream &stream) {
+  auto cursor = stream.cursor();
+  while (stream) {
+    advance_to(std::not_fn(isspace));
+    auto c = stream.read_char();
+    if (c == '<') {
+      fail_if(stream.at_eos());
+      auto n = stream.peek();
+      if (n == '/') {
+        co_yield parse_tag_close<Config>(stream);
+        co_return;
+      }
+      parse_tag<Config>(stream);
+    }
+
+    auto content = parse_to(stream, xml::xml_string_end);
+    fail_if(!content);
+    co_yield tag_content{*content};
+  }
+}
+
+template <config Config>
+configurable_xml_parser<Config> parse_tag_attributes(char_stream &stream) {
+  while (stream) {
+    advance_to(std::not_fn(isspace));
+    if (stream.peek() == '>') {
+      stream.advance();
+      co_return;
+    }
+    if (stream.peek() == '/') {
+      stream.advance();
+      co_yield tag_self_close{};
+      co_return;
+    }
+
+    auto key = parse_to(stream, xml::xml_word_end);
+    fail_if(!key);
+    advance_to(std::not_fn(isspace));
+    fail_if(stream.peek() != '=');
+    stream.advance();
+    advance_to(std::not_fn(isspace));
+    fail_if(stream.peek() != '"');
+    stream.advance();
+    auto value = parse_to(stream, xml::xml_string_end);
+    fail_if(!value);
+    co_yield tag_attribute{*key, *value};
+  }
+  co_return;
+}
+
+template <size_t S>
+size_t tag_end(char_stream &stream, const char (&pattern)[S]) {
+  const char *current = pattern;
+  auto beg = stream.cursor();
+  size_t result = std::string::npos;
+
+  while (stream) {
+    auto c = stream.read_char();
+
+    if (c == '"' && !stream.seek(xml::xml_string_end(stream))) {
+      break;
+    }
+
+    if (c == *current) {
+      current++;
+      if (current == pattern + S - 1) {
+        result = stream.cursor() + 1;
+        break;
+      }
+    } else {
+      current = pattern;
+    }
+  }
+
+  stream.seek(beg);
+  return result;
 }
 
 template <config Config>
 configurable_xml_parser<Config> parse_tag(char_stream &stream) {
   stream.advance();
+  fail_if(stream.at_eos());
   switch (stream.peek()) {
-  case '/':
+  case '?': {
+    auto x = tag_end(stream, "?>");
     break;
+  }
+  case '!': {
+    auto x = tag_end(stream, ">");
+    break;
+  }
   default: {
     co_yield parse_tag_name<Config>(stream);
+    co_yield parse_tag_attributes<Config>(stream);
+    co_yield parse_tag_content<Config>(stream);
   }
   }
   co_return;
@@ -236,7 +364,6 @@ template <config Config>
 configurable_xml_parser<Config> coro_parse_xml(char_stream &stream) {
   while (stream) {
     if (!find_opening_char(stream)) {
-      std::cout << "no opening char" << std::endl;
       co_return;
     }
 
@@ -252,50 +379,27 @@ struct print_xml_t {
   void operator()(tag_open t) const {
     std::cout << "Tag open: " << t.name << std::endl;
   }
+
   void operator()(tag_attribute t) const {
-    std::cout << "Attribute: " << t.key << " -> "
-              << "value" << std::endl;
+    std::cout << "Attribute: " << t.key << " -> " << t.value << std::endl;
   }
 
   void operator()(tag_close t) const {
-    std::cout << "Tag close: " << t.name << " (self closing? " << std::boolalpha
-              << t.self_closing << ") " << std::endl;
+    std::cout << "Tag close: " << t.name << std::endl;
   }
+
+  void operator()(tag_self_close t) const {
+    std::cout << "Tag self-closes" << std::endl;
+  }
+
   void operator()(tag_content t) const {
     std::cout << "Content: " << t.content << std::endl;
   }
+
   void operator()(comment t) const {
     std::cout << "Comment: " << t.comment << std::endl;
   }
 } constexpr static inline print_xml{};
-
-template <config Config>
-configurable_xml_parser<Config> parse_fake_tag(std::string str) {
-
-  co_yield tag_open{str};
-  co_yield tag_attribute{"attr1", "val1"};
-  co_yield [&]() -> configurable_xml_parser<Config> {
-    co_yield tag_open{str + ":nested"};
-    co_yield tag_attribute{"attr2", "val2"};
-    co_yield [&]() -> configurable_xml_parser<Config> {
-      co_yield tag_open{str + ":nested:nested"};
-      co_yield [&]() -> configurable_xml_parser<Config> { co_return; }();
-      co_yield tag_close{str + ":nested:nested"};
-    }();
-    co_yield tag_close{str + ":nested"};
-  }();
-  co_yield tag_close{str};
-}
-
-template <config Config>
-configurable_xml_parser<Config> parse_fake_xml(char_stream &stream) {
-  co_yield parse_fake_tag<Config>("fake1");
-  co_yield comment{"comment"};
-  co_yield parse_fake_tag<Config>("fake2");
-}
-xml_parser parse_fake_xml(char_stream &stream) {
-  return parse_fake_xml<config{}>(stream);
-}
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {

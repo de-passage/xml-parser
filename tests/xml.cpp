@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
 
   auto f = slurp_file(argv[1]);
 
-  auto xml = parse_xml(f);
+  auto xml = build_xml_doc(f);
   if (!xml) {
     return 1;
   }
