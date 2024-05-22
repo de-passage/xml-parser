@@ -22,24 +22,19 @@ namespace xml {
 
 #define advance_to(...) fail_if(!stream.seek(__VA_ARGS__))
 
-std::optional<std::string_view> parse_to(char_stream &stream, auto &&func) {
-  auto end = std::forward<decltype(func)>(func)(stream);
-  fail_if(end == std::string::npos);
-  return stream.consume_to(end);
-}
-
 std::optional<std::string_view> next_string_or_word(char_stream &stream) {
   advance_to(std::not_fn(isspace));
 
   char c = stream.peek();
   if (c == '"') {
-    return parse_to(stream, xml_string_end);
+    return syntax::parse_to(stream, xml_string_end);
   } else if (xml_tag_head(c)) {
-    return parse_to(stream, xml_word_end);
+    return syntax::parse_to(stream, xml_word_end);
   }
   return std::nullopt;
 }
 
+namespace tree {
 template <size_t S>
 size_t tag_end(char_stream &stream, const char (&pattern)[S]) {
   const char *current = pattern;
@@ -93,7 +88,7 @@ std::optional<opening_tag> parse_attributes(char_stream &stream) {
     }
 
     if (xml_tag_head(c)) {
-      parse_to(stream, xml_word_end)
+      syntax::parse_to(stream, xml_word_end)
           .transform([&attrs](std::string_view attr_name_end) {
             attrs.emplace_back(xml::attribute{
                 .name = std::string{attr_name_end},
@@ -212,6 +207,7 @@ std::optional<xml::tag> parse_current_tag_body(char_stream &stream,
   return std::nullopt;
 }
 
+} // namespace tree
 } // namespace xml
 
 std::optional<xml::tag> build_xml_doc(char_stream &stream) {
@@ -222,7 +218,7 @@ std::optional<xml::tag> build_xml_doc(char_stream &stream) {
   tag_stack.push(current_tag);
 
   while (stream) {
-    if (auto maybe_tag = xml::next_tag(stream); maybe_tag.has_value()) {
+    if (auto maybe_tag = xml::tree::next_tag(stream); maybe_tag.has_value()) {
       root.children.emplace_back(std::move(maybe_tag).value());
     } else {
       break;
@@ -230,3 +226,7 @@ std::optional<xml::tag> build_xml_doc(char_stream &stream) {
   }
   return root;
 }
+
+namespace xml {
+
+} // namespace xml
